@@ -1,7 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { redirectOnUnauthorized } from "@/lib/client-auth";
+import { fileUploadPercent, formatUploadDuration, isActiveUpload, nextUploadBatch, summarizeUploads, UPLOAD_REFRESH_MS, uploadPageTitle, UploadSpeedMeter, type UploadItem } from "@/lib/upload-progress";
+import { sendUpload } from "@/lib/upload-request";
 
 export type ShareFile = {
   id: string;
@@ -10,9 +12,6 @@ export type ShareFile = {
   createdAt: number;
   downloadUrl: string;
 };
-
-type UploadStatus = "queued" | "uploading" | "done" | "error" | "canceled";
-type UploadItem = { id: string; file: File; progress: number; status: UploadStatus; error?: string; retryable?: boolean };
 
 type FileManagerProps = { initialFiles: ShareFile[]; maxUploadBytes: number };
 
@@ -29,6 +28,10 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
   const queueRef = useRef<UploadItem[]>([]);
   const xhrsRef = useRef<Map<string, XMLHttpRequest>>(new Map());
   const workerRef = useRef(false);
+  const mountedRef = useRef(true);
+  const batchRef = useRef(0);
+  const uploadTickerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const originalTitleRef = useRef<string | null>(null);
   const dragDepth = useRef(0);
   const pickerRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -65,59 +68,47 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
     if (workerRef.current) return;
     workerRef.current = true;
     try {
-      while (true) {
+      while (mountedRef.current) {
         const next = queueRef.current.find((item) => item.status === "queued");
         if (!next) break;
-        updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "uploading", progress: 0 } : item));
-
-        const result = await new Promise<{ kind: "done" | "error" | "canceled" | "unauthorized"; file?: ShareFile; message?: string }>((resolve) => {
-          const xhr = new XMLHttpRequest();
-          xhrsRef.current.set(next.id, xhr);
-          try {
-            xhr.open("POST", "/api/files");
-            xhr.setRequestHeader("Content-Type", "application/octet-stream");
-            xhr.setRequestHeader("X-File-Name", encodeURIComponent(next.file.name));
-            xhr.upload.onprogress = (event) => {
-              if (!event.lengthComputable) return;
-              const progress = Math.min(99, Math.round((event.loaded / event.total) * 100));
-              updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, progress } : item));
-            };
-            xhr.onload = () => {
-              let body: { id?: string; name?: string; size?: number; createdAt?: number; downloadUrl?: string; error?: string } = {};
-              try { body = JSON.parse(xhr.responseText) as typeof body; } catch { /* use status fallback */ }
-              if (xhr.status === 401) {
-                resolve({ kind: "unauthorized" });
-                return;
-              }
-              if (xhr.status === 201 && body.id && body.name && body.downloadUrl) {
-                resolve({ kind: "done", file: { id: body.id, name: body.name, size: body.size ?? next.file.size, createdAt: body.createdAt ?? Date.now(), downloadUrl: body.downloadUrl } });
-              } else {
-                resolve({ kind: "error", message: body.error || (xhr.status === 413 ? "文件超过服务器的大小上限。" : `上传失败（${xhr.status || "网络错误"}），请重试。`) });
-              }
-            };
-            xhr.onerror = () => resolve({ kind: "error", message: "网络中断，文件没有上传完成。" });
-            xhr.onabort = () => resolve({ kind: "canceled" });
-            xhr.send(next.file);
-          } catch {
-            resolve({ kind: "error", message: "浏览器无法开始上传这个文件。" });
-          }
+        updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "uploading", loadedBytes: 0, speedBps: null } : item));
+        const meter = new UploadSpeedMeter(performance.now());
+        const xhr = new XMLHttpRequest();
+        xhrsRef.current.set(next.id, xhr);
+        // Progress events update the meter; only the ticker publishes React state.
+        uploadTickerRef.current = setInterval(() => {
+          const speedBps = meter.speed(performance.now());
+          updateQueue((items) => items.map((item) => item.id === next.id && item.status === "uploading" ? { ...item, loadedBytes: meter.loadedBytes, speedBps } : item));
+        }, UPLOAD_REFRESH_MS);
+        const result = await sendUpload(next.file, xhr, {
+          onProgress: (loadedBytes) => meter.record(loadedBytes, performance.now()),
+          onProcessing: () => {
+            meter.record(next.file.size, performance.now());
+            if (uploadTickerRef.current) clearInterval(uploadTickerRef.current);
+            uploadTickerRef.current = null;
+            updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "processing", loadedBytes: next.file.size, speedBps: null } : item));
+          },
         });
 
+        if (uploadTickerRef.current) clearInterval(uploadTickerRef.current);
+        uploadTickerRef.current = null;
         xhrsRef.current.delete(next.id);
+        if (!mountedRef.current) break;
         if (result.kind === "unauthorized") {
+          updateQueue((items) => items.map((item) => isActiveUpload(item) ? { ...item, status: "error", speedBps: null, error: "登录已过期，请重新登录。" } : item));
           redirectOnUnauthorized(401, (path) => window.location.assign(path));
           break;
         }
-        if (result.kind === "done" && result.file) {
-          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "done", progress: 100 } : item));
-          setFiles((current) => [result.file!, ...current.filter((file) => file.id !== result.file!.id)]);
+        if (result.kind === "done") {
+          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "done", loadedBytes: next.file.size, speedBps: null } : item));
+          setFiles((current) => [result.file, ...current.filter((file) => file.id !== result.file.id)]);
           setSelectedFileId(result.file.id);
           notify(`“${result.file.name}”已上传完成，可以复制分享链接。`);
         } else if (result.kind === "canceled") {
-          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "canceled", progress: 0 } : item));
+          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "canceled", speedBps: null } : item));
         } else {
-          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "error", error: result.message || "上传失败。" } : item));
-          notify(`${next.file.name}：${result.message || "上传失败。"}`);
+          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "error", loadedBytes: meter.loadedBytes, speedBps: null, error: result.message } : item));
+          notify(`${next.file.name}：${result.message}`);
         }
       }
     } finally {
@@ -126,16 +117,20 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
   }, [notify, updateQueue]);
 
   const enqueueFiles = useCallback((fileList: FileList | File[]) => {
-    const newItems = Array.from(fileList).map((file) => ({
+    const selectedFiles = Array.from(fileList);
+    if (!selectedFiles.length) return;
+    batchRef.current = nextUploadBatch(queueRef.current, batchRef.current);
+    const newItems: UploadItem[] = selectedFiles.map((file) => ({
       id: crypto.randomUUID(),
+      batchId: batchRef.current,
       file,
-      progress: 0,
-      status: (file.size > maxUploadBytes ? "error" : "queued") as UploadStatus,
+      loadedBytes: 0,
+      speedBps: null,
+      status: file.size > maxUploadBytes ? "error" : "queued",
       error: file.size > maxUploadBytes ? `超过单文件上限 ${formatSize(maxUploadBytes)}，未开始上传。` : undefined,
       retryable: file.size <= maxUploadBytes,
     }));
-    if (!newItems.length) return;
-    updateQueue((items) => [...items, ...newItems]);
+    updateQueue((items) => [...items.filter((item) => !item.hidden || item.batchId === batchRef.current), ...newItems]);
     const readyCount = newItems.filter((item) => item.status === "queued").length;
     const rejectedCount = newItems.length - readyCount;
     if (readyCount && rejectedCount) notify(`${readyCount} 个文件已加入队列，${rejectedCount} 个文件超过大小上限。`);
@@ -185,10 +180,20 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("dragleave", onDragLeave);
       window.removeEventListener("drop", onDrop);
-      xhrsRef.current.forEach((xhr) => xhr.abort());
-      if (toastTimer.current) clearTimeout(toastTimer.current);
     };
   }, [enqueueFiles]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    originalTitleRef.current = document.title;
+    return () => {
+      mountedRef.current = false;
+      xhrsRef.current.forEach((xhr) => xhr.abort());
+      if (uploadTickerRef.current) clearInterval(uploadTickerRef.current);
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      document.title = originalTitleRef.current ?? document.title;
+    };
+  }, []);
 
   useEffect(() => {
     function onShortcut(event: KeyboardEvent) {
@@ -211,14 +216,14 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
   }, [files, query, view]);
   const recentCount = useMemo(() => files.filter((file) => file.createdAt >= Date.now() - 7 * 24 * 60 * 60 * 1000).length, [files]);
 
-  async function copyLink(file: ShareFile) {
+  const copyLink = useCallback(async (file: ShareFile) => {
     try {
       await navigator.clipboard.writeText(file.downloadUrl);
       notify("分享链接已复制到剪贴板。");
     } catch {
       notify("复制失败，请检查浏览器剪贴板权限。");
     }
-  }
+  }, [notify]);
 
   async function deleteFile(file: ShareFile) {
     if (!window.confirm(`确定删除“${file.name}”吗？删除后，此分享链接将立即失效。`)) return;
@@ -245,20 +250,27 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
   }
 
   function cancelUpload(upload: UploadItem) {
-    if (upload.status === "uploading") xhrsRef.current.get(upload.id)?.abort();
+    if (upload.status === "uploading" || upload.status === "processing") xhrsRef.current.get(upload.id)?.abort();
     else if (upload.status === "queued") {
       updateQueue((items) => items.map((item) => item.id === upload.id ? { ...item, status: "canceled" } : item));
     } else {
-      updateQueue((items) => items.filter((item) => item.id !== upload.id));
+      updateQueue((items) => items.map((item) => item.id === upload.id ? { ...item, hidden: true } : item));
     }
   }
 
   function retryUpload(upload: UploadItem) {
-    updateQueue((items) => items.map((item) => item.id === upload.id ? { ...item, status: "queued", progress: 0, error: undefined } : item));
+    batchRef.current = nextUploadBatch(queueRef.current, batchRef.current);
+    updateQueue((items) => items.filter((item) => !item.hidden || item.batchId === batchRef.current).map((item) => item.id === upload.id ? { ...item, batchId: batchRef.current, status: "queued", loadedBytes: 0, speedBps: null, error: undefined } : item));
     void runQueue();
   }
 
-  const activeUploads = uploads.filter((upload) => upload.status === "queued" || upload.status === "uploading").length;
+  const visibleUploads = uploads.filter((upload) => !upload.hidden);
+  const summary = summarizeUploads(uploads, batchRef.current);
+  const activeUploads = summary.activeCount;
+  const progressTitle = activeUploads ? uploadPageTitle(summary, "") : null;
+  useEffect(() => {
+    document.title = progressTitle ?? originalTitleRef.current ?? document.title;
+  }, [progressTitle]);
   const filteredSelectedFile = filteredFiles.find((file) => file.id === selectedFileId) ?? filteredFiles[0] ?? null;
   const totalBytes = files.reduce((total, file) => total + file.size, 0);
   const filteredBytes = filteredFiles.reduce((total, file) => total + file.size, 0);
@@ -317,10 +329,11 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
 
             <aside className="fm-side-panels" aria-label="上传与文件详情">
               <section className="fm-card fm-queue-panel" id="upload-queue" tabIndex={-1} aria-labelledby="upload-queue-title">
-                <header className="fm-panel-header"><div className="fm-panel-title"><h2 id="upload-queue-title">上传队列</h2><span className="fm-count">{activeUploads}</span></div><button className="fm-text-button" onClick={() => updateQueue((items) => items.filter((item) => item.status === "queued" || item.status === "uploading"))} type="button">清除已完成</button></header>
+                <header className="fm-panel-header"><div className="fm-panel-title"><h2 id="upload-queue-title">上传队列</h2><span className="fm-count">{activeUploads}</span></div><button className="fm-text-button" disabled={!visibleUploads.some((item) => item.status === "done")} onClick={() => updateQueue((items) => items.map((item) => item.status === "done" ? { ...item, hidden: true } : item))} type="button">清除已完成</button></header>
+                {summary.totalCount > 0 && <UploadSummary summary={summary} />}
                 <div className="fm-queue-list">
-                  {uploads.map((upload) => <UploadRow key={upload.id} item={upload} onCancel={cancelUpload} onRetry={retryUpload} />)}
-                  {uploads.length === 0 && <div className="fm-queue-empty"><span className="fm-queue-empty-icon"><UploadIcon /></span><strong>当前没有上传任务</strong><span>选择文件或拖放到页面即可开始上传。</span><button className="fm-text-button" onClick={() => pickerRef.current?.click()} type="button">选择文件</button></div>}
+                  {visibleUploads.map((upload) => <UploadRow key={upload.id} item={upload} onCancel={cancelUpload} onRetry={retryUpload} />)}
+                  {visibleUploads.length === 0 && <div className="fm-queue-empty"><span className="fm-queue-empty-icon"><UploadIcon /></span><strong>当前没有上传任务</strong><span>选择文件或拖放到页面即可开始上传。</span><button className="fm-text-button" onClick={() => pickerRef.current?.click()} type="button">选择文件</button></div>}
                 </div>
                 <footer className="fm-panel-foot"><LockIcon />上传时可继续浏览和分享文件</footer>
               </section>
@@ -349,24 +362,47 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
   );
 }
 
+function UploadProgressBar({ value, label }: { value: number; label: string }) {
+  return <div className="fm-progress-track" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={value}><span style={{ transform: `scaleX(${value / 100})` }} /></div>;
+}
+
+function formatTransferSpeed(speedBps: number | null) {
+  return speedBps === null ? "—" : `${formatSize(Math.round(speedBps))}/s`;
+}
+
+function UploadSummary({ summary }: { summary: ReturnType<typeof summarizeUploads> }) {
+  return <div className={`fm-upload-summary${summary.completedCount === summary.totalCount ? " is-complete" : ""}`} aria-label="本轮上传进度">
+    <div className="fm-upload-summary-heading"><span>总体进度</span><strong>{summary.progress}%</strong></div>
+    <UploadProgressBar value={summary.progress} label="总体上传进度" />
+    <p className="fm-upload-summary-bytes">{formatSize(summary.loadedBytes)} <span>/ {formatSize(summary.totalBytes)}</span></p>
+    <dl className="fm-upload-summary-metrics"><div><dt>当前速度</dt><dd>{formatTransferSpeed(summary.speedBps)}</dd></div><div><dt>预计剩余</dt><dd>{formatUploadDuration(summary.remainingSeconds)}</dd></div></dl>
+    <p className="fm-upload-summary-counts"><span>本轮已完成 {summary.completedCount}/{summary.totalCount}</span><span>{summary.waitingCount} 个等待</span>{summary.failedCount > 0 && <span className="fm-upload-failed-count">{summary.failedCount} 个失败</span>}</p>
+  </div>;
+}
+
 function UploadRow({ item, onCancel, onRetry }: { item: UploadItem; onCancel: (item: UploadItem) => void; onRetry: (item: UploadItem) => void }) {
-  const statusLabel = item.status === "queued" ? "等待中" : item.status === "uploading" ? `${item.progress}%` : item.status === "done" ? "已完成" : item.status === "canceled" ? "已取消" : "上传失败";
+  const progress = fileUploadPercent(item);
+  const transferring = item.status === "uploading" || item.status === "processing";
+  const statusLabel = item.status === "queued" ? "等待中" : item.status === "uploading" ? `${progress}%` : item.status === "processing" ? "处理中" : item.status === "done" ? "已完成" : item.status === "canceled" ? "已取消" : "上传失败";
+  const remainingSeconds = item.speedBps !== null && item.speedBps > 0 && item.loadedBytes < item.file.size ? (item.file.size - item.loadedBytes) / item.speedBps : null;
   return (
     <div className={`fm-upload-row status-${item.status}`}>
       <span className="fm-upload-file-icon" data-type={item.file.name.split(".").pop()?.slice(0, 4).toUpperCase()}><FileGlyph name={item.file.name} /></span>
       <div className="fm-upload-row-main">
-        <div className="fm-upload-file-info"><strong title={item.file.name}>{item.file.name}</strong><span>{formatSize(item.file.size)}</span></div>
-                {item.status === "error" ? <p className="fm-upload-error">{item.error}</p> : <div className="fm-progress-track"><span style={{ width: `${item.status === "done" ? 100 : item.progress}%` }} /></div>}
+        <div className="fm-upload-file-info"><strong title={item.file.name}>{item.file.name}</strong><span className={`fm-upload-status status-${item.status}`}>{item.status === "done" && <CheckIcon />}{statusLabel}</span></div>
+        {(transferring || item.status === "done") && <UploadProgressBar value={progress} label={`${item.file.name} 上传进度`} />}
+        <div className="fm-upload-transfer-bytes">{transferring || item.status === "error" ? `${formatSize(item.loadedBytes)} / ${formatSize(item.file.size)}` : formatSize(item.file.size)}</div>
+        {transferring && <div className="fm-upload-transfer-meta">{item.status === "processing" ? <span role="status">服务器处理中</span> : <><span>{formatTransferSpeed(item.speedBps)}</span><span>预计剩余 {formatUploadDuration(remainingSeconds)}</span></>}</div>}
+        {item.status === "error" && <p className="fm-upload-error">{item.error}</p>}
       </div>
-      <span className={`fm-upload-status status-${item.status}`}>{item.status === "done" && <CheckIcon />}{statusLabel}</span>
       {item.status === "error" && item.retryable !== false && <button className="fm-button fm-retry-button" onClick={() => onRetry(item)} type="button">重试</button>}
-      {item.status !== "done" && item.status !== "error" && item.status !== "canceled" && <button className="fm-icon-button fm-queue-action" aria-label={item.status === "uploading" ? `取消上传 ${item.file.name}` : `移除 ${item.file.name}`} onClick={() => onCancel(item)} type="button"><CloseIcon /></button>}
+      {isActiveUpload(item) && <button className="fm-icon-button fm-queue-action" aria-label={transferring ? `取消上传 ${item.file.name}` : `移除 ${item.file.name}`} onClick={() => onCancel(item)} type="button"><CloseIcon /></button>}
       {(item.status === "done" || item.status === "error" || item.status === "canceled") && <button className="fm-icon-button fm-queue-action" aria-label={`从队列移除 ${item.file.name}`} onClick={() => onCancel(item)} type="button"><CloseIcon /></button>}
     </div>
   );
 }
 
-function FileRow({ file, selected, onSelect, onCopy }: { file: ShareFile; selected: boolean; onSelect: (id: string) => void; onCopy: (file: ShareFile) => void }) {
+const FileRow = memo(function FileRow({ file, selected, onSelect, onCopy }: { file: ShareFile; selected: boolean; onSelect: (id: string) => void; onCopy: (file: ShareFile) => void }) {
   return (
     <tr className={selected ? "fm-file-row selected" : "fm-file-row"}>
       <td><button className="fm-file-select" onClick={() => onSelect(file.id)} type="button" aria-pressed={selected}><span className="fm-file-name"><span className="fm-file-glyph" data-type={file.name.split(".").pop()?.slice(0, 4).toUpperCase()}><FileGlyph name={file.name} /></span><span className="fm-file-copy"><strong title={file.name}>{file.name}</strong><span>分享链接已启用</span><span className="fm-mobile-meta">{formatSize(file.size)} · {formatDate(file.createdAt)}</span></span></span></button></td>
@@ -375,7 +411,7 @@ function FileRow({ file, selected, onSelect, onCopy }: { file: ShareFile; select
       <td><button className="fm-icon-button fm-copy-row" onClick={() => onCopy(file)} type="button" aria-label={`复制 ${file.name} 分享链接`} title="复制分享链接"><LinkIcon /></button></td>
     </tr>
   );
-}
+});
 
 function EmptyState({ hasQuery, hasFiles, onChoose }: { hasQuery: boolean; hasFiles: boolean; onChoose: () => void }) {
   return (
