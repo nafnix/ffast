@@ -63,12 +63,20 @@ docker compose down
 
 GitHub Actions 会在 Pull Request 和分支推送时运行依赖安装、测试和生产构建。检查通过后，默认分支推送会发布 `latest` 和 `sha-<短提交号>`；推送 `v1.2.3` 这样的版本标签会发布 `1.2.3`、`1.2` 和 `1`。`latest` 只跟随默认分支。Pull Request 和非默认分支不会发布镜像。
 
-发布新版本时，创建并推送符合 `v主版本.次版本.修订版本` 格式的标签，例如：
+项目使用 bumpp 管理版本发布，以 `package.json` 的 `version` 为版本来源。建议使用与 CI 一致的 Node.js 24（24.11 或更新版本）和 pnpm 11。先提交所有待发布的修改，确保工作区干净，再切换到 `master` 并同步远端：
 
 ```sh
-git tag v1.2.3
-git push origin v1.2.3
+git switch master
+git pull --ff-only
+pnpm install --frozen-lockfile
+pnpm release
 ```
+
+在交互提示中选择 `patch`（修订版本）、`minor`（次版本）或 `major`（主版本），确认后会自动更新 `package.json`、创建 `chore: release vX.Y.Z` 提交、创建 `vX.Y.Z` Git 标签，并推送当前分支和版本标签。取消确认不会修改版本或创建提交、标签。
+
+例如，当前版本为 `1.0.0` 时选择 `patch`，会升级到 `1.0.1` 并推送 `v1.0.1`，触发 GitHub Actions 发布 `nafnix/ffast:1.0.1`、`nafnix/ffast:1.0` 和 `nafnix/ffast:1`；`master` 上的版本提交同时触发 `latest` 和 SHA 标签发布。等待 Actions 成功后，可在部署目录的 `.env` 中设置 `IMAGE_TAG=1.0.1`，再运行 `docker compose pull` 和 `docker compose up -d`。
+
+发布时请选择正式版本 `X.Y.Z`。当前 CI 仅接受 `vX.Y.Z` 格式，`beta`、`rc` 等预发布标签会被拒绝。
 
 ## 反向代理
 

@@ -9,6 +9,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "start": "next start --hostname 0.0.0.0",
+    "release": "bumpp --git-check --commit \"chore: release v{version}\" --tag \"v{version}\" --push",
     "reset-password": "node scripts/reset-password.mjs"
   },
   "engines": {
@@ -26,6 +27,7 @@
     "@types/node": "^26.6.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "bumpp": "^12.2.1",
     "typescript": "^7.0.2",
     "vitest": "^5.0.4"
   },
