@@ -436,13 +436,18 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .fm-upload-summary-counts .fm-upload-failed-count { color: #ad4e54; }
 .fm-queue-list { max-height: 346px; overflow-y: auto; padding: 0 13px; }
 .fm-upload-row { display: flex; min-height: 68px; align-items: center; gap: 8px; padding-block: 12px; border-bottom: 1px solid var(--fm-soft-line); }
-.fm-upload-row.status-uploading, .fm-upload-row.status-processing { min-height: 110px; }
+.fm-upload-row.status-uploading, .fm-upload-row.status-processing { min-height: 96px; }
 .fm-upload-row:last-child { border-bottom: 0; }
 .fm-upload-file-icon { display: grid; width: 23px; height: 31px; flex: 0 0 auto; place-items: center; position: relative; color: #85858f; }
 .fm-upload-file-icon .file-icon { display: grid; width: 21px; height: 27px; place-items: center; border: 0; color: inherit; background: transparent; }
 .fm-upload-file-icon .file-icon svg { width: 20px; height: 24px; }
 .fm-upload-file-icon::after { position: absolute; right: 0; bottom: 0; left: 0; background: #fff; content: attr(data-type); color: currentColor; font-size: 8px; font-weight: 650; line-height: 10px; text-align: center; }
 .fm-upload-row-main { min-width: 0; flex: 1; }
+.fm-upload-progress-row { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+.fm-upload-progress-main { flex: 1; min-width: 0; padding-top: 13px; }
+.fm-upload-progress-main > .fm-progress-track { height: 2px; }
+.fm-upload-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+
 .fm-upload-file-info { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 8px; }
 .fm-upload-file-info strong { overflow: hidden; color: #494951; font-size: 12px; font-weight: 480; text-overflow: ellipsis; white-space: nowrap; }
 .fm-upload-file-info > span { flex: 0 0 auto; color: #74747d; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -451,14 +456,15 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .fm-upload-row.status-done .fm-progress-track > span { background: var(--fm-green); }
 .fm-upload-row.status-error .fm-upload-file-info { margin-bottom: 3px; }
 .fm-upload-error { margin: 5px 0 0; color: #ad4e54; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
-.fm-upload-transfer-bytes { margin-top: 6px; color: var(--fm-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+.fm-upload-transfer-stats { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 8px; margin-top: 6px; color: var(--fm-secondary); font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.5; }
+.fm-upload-transfer-speed { margin-left: auto; text-align: right; }
 .fm-upload-transfer-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; color: var(--fm-secondary); font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.5; }
 .fm-upload-status { display: inline-flex; min-width: 49px; flex: 0 0 auto; align-items: center; justify-content: flex-end; gap: 4px; color: #777780; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .fm-upload-status svg { width: 13px; height: 13px; color: var(--fm-green); }
 .fm-upload-status.status-done { color: var(--fm-green); }
 .fm-upload-status.status-error { color: #ad4e54; }
-.fm-queue-action { width: 25px; height: 25px; }
-.fm-queue-action svg { width: 14px; height: 14px; }
+.fm-icon-button.fm-queue-action { width: 28px; height: 28px; }
+.fm-queue-action svg { width: 16px; height: 16px; }
 .fm-retry-button { min-height: 27px; padding: 0 7px; border-color: #e9dcdc; color: #a54c53; font-size: 11px; }
 .fm-retry-button:hover { border-color: #dfc9cb; color: #8f343b; background: #fffafa; }
 .fm-queue-empty { min-height: 171px; gap: 8px; }
@@ -587,7 +593,6 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   .fm-upload-file-info strong { font-size: 11px; }
   .fm-upload-file-info > span { font-size: 10px; }
   .fm-upload-status { min-width: 43px; font-size: 10px; }
-  .fm-queue-action { width: 23px; }
   .fm-upload-summary { padding-inline: 10px; }
   .fm-upload-transfer-meta { column-gap: 8px; }
   .fm-panel-foot { min-height: 33px; padding-inline: 11px; font-size: 10px; }

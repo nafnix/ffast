@@ -1,11 +1,15 @@
 export const UPLOAD_REFRESH_MS = 250;
 const SPEED_WINDOW_MS = 3000;
 
-export type UploadStatus = "queued" | "uploading" | "processing" | "done" | "error" | "canceled";
+export type UploadStatus = "paused" | "queued" | "uploading" | "processing" | "done" | "error" | "canceled";
 export type UploadItem = {
+  sessionId?: string;
+  needsFile?: boolean;
+  lastModified?: number;
   id: string;
   batchId: number;
   file: File;
+  confirmedBytes?: number;
   loadedBytes: number;
   speedBps: number | null;
   status: UploadStatus;
@@ -66,8 +70,9 @@ export class UploadSpeedMeter {
   loadedBytes = 0;
   private samples: { at: number; bytes: number }[];
 
-  constructor(startedAt: number) {
-    this.samples = [{ at: startedAt, bytes: 0 }];
+  constructor(startedAt: number, baseline = 0) {
+    this.loadedBytes = baseline;
+    this.samples = [{ at: startedAt, bytes: baseline }];
   }
 
   record(loadedBytes: number, now: number) {

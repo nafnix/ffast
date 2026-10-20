@@ -3,7 +3,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { redirectOnUnauthorized } from "@/lib/client-auth";
 import { fileUploadPercent, formatUploadDuration, isActiveUpload, nextUploadBatch, summarizeUploads, UPLOAD_REFRESH_MS, uploadPageTitle, UploadSpeedMeter, type UploadItem } from "@/lib/upload-progress";
-import { sendUpload } from "@/lib/upload-request";
+import { uploadTaskId, transferFile, savedUploads, saveUpload, forgetUpload } from "@/lib/resumable-client";
 
 export type ShareFile = {
   id: string;
@@ -26,7 +26,7 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
   const [loggingOut, setLoggingOut] = useState(false);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(initialFiles[0]?.id ?? null);
   const queueRef = useRef<UploadItem[]>([]);
-  const xhrsRef = useRef<Map<string, XMLHttpRequest>>(new Map());
+  const controllersRef = useRef<Map<string, AbortController>>(new Map());
   const workerRef = useRef(false);
   const mountedRef = useRef(true);
   const batchRef = useRef(0);
@@ -47,6 +47,16 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
     if (toastTimer.current) clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(""), 3600);
   }, []);
+
+  useEffect(() => {
+    const restored: UploadItem[] = savedUploads().map(record => ({
+      id: record.id, sessionId: record.sessionId, batchId: 0,
+      file: { name: record.name, size: record.size, lastModified: record.lastModified } as File,
+      loadedBytes: record.loadedBytes, confirmedBytes: record.loadedBytes, lastModified: record.lastModified, speedBps: null,
+      status: "paused", needsFile: true,
+    }));
+    updateQueue(items => items.length ? items : restored);
+  }, [updateQueue]);
 
   const refreshFiles = useCallback(async () => {
     setLoading(true);
@@ -71,28 +81,55 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
       while (mountedRef.current) {
         const next = queueRef.current.find((item) => item.status === "queued");
         if (!next) break;
-        updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "uploading", loadedBytes: 0, speedBps: null } : item));
-        const meter = new UploadSpeedMeter(performance.now());
-        const xhr = new XMLHttpRequest();
-        xhrsRef.current.set(next.id, xhr);
+        updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "uploading", loadedBytes: item.confirmedBytes ?? 0, speedBps: null } : item));
+        let meter = new UploadSpeedMeter(performance.now(), next.confirmedBytes ?? 0);
+        const xhr = new AbortController();
+        controllersRef.current.set(next.id, xhr);
         // Progress events update the meter; only the ticker publishes React state.
         uploadTickerRef.current = setInterval(() => {
           const speedBps = meter.speed(performance.now());
           updateQueue((items) => items.map((item) => item.id === next.id && item.status === "uploading" ? { ...item, loadedBytes: meter.loadedBytes, speedBps } : item));
         }, UPLOAD_REFRESH_MS);
-        const result = await sendUpload(next.file, xhr, {
-          onProgress: (loadedBytes) => meter.record(loadedBytes, performance.now()),
+        let baseline = next.confirmedBytes ?? 0;
+        let firstCheckpoint = true;
+        const result = await transferFile(next.file, xhr.signal, next.sessionId, {
+          onSession: (sessionId) => {
+            next.sessionId = sessionId;
+            updateQueue(items => items.map(item => item.id === next.id ? { ...item, sessionId } : item));
+            saveUpload({ id: next.id, name: next.file.name, size: next.file.size, lastModified: next.file.lastModified, sessionId, loadedBytes: baseline, updated: Date.now() });
+          },
+          onCheckpoint: (bytes) => {
+            baseline = bytes;
+            if (firstCheckpoint) {
+              meter = new UploadSpeedMeter(performance.now(), bytes);
+              firstCheckpoint = false;
+            } else meter.record(bytes, performance.now());
+            updateQueue(items => items.map(item => item.id === next.id ? { ...item, confirmedBytes: bytes, loadedBytes: bytes } : item));
+            saveUpload({ id: next.id, name: next.file.name, size: next.file.size, lastModified: next.file.lastModified, sessionId: next.sessionId, loadedBytes: bytes, updated: Date.now() });
+          },
+          onProgress: (loadedBytes) => {
+            meter.record(loadedBytes, performance.now());
+          },
           onProcessing: () => {
-            meter.record(next.file.size, performance.now());
             if (uploadTickerRef.current) clearInterval(uploadTickerRef.current);
             uploadTickerRef.current = null;
-            updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "processing", loadedBytes: next.file.size, speedBps: null } : item));
+            updateQueue(items => items.map(item => item.id === next.id ? { ...item, status: "processing", loadedBytes: next.file.size, speedBps: null } : item));
           },
+        }).then(file => ({ kind: "done" as const, file })).catch((error) => {
+          if (xhr.signal.aborted) return { kind: "canceled" as const };
+          if (error.status === 401) return { kind: "unauthorized" as const };
+          if (error.status === 422) updateQueue(items => items.map(item => item.id === next.id ? { ...item, needsFile: true } : item));
+          if (error.status === 410) {
+            next.sessionId = undefined;
+            saveUpload({ id: next.id, name: next.file.name, size: next.file.size, lastModified: next.file.lastModified, loadedBytes: 0, updated: Date.now() });
+            updateQueue(items => items.map(item => item.id === next.id ? { ...item, sessionId: undefined } : item));
+          }
+          return { kind: "error" as const, message: error instanceof Error ? error.message : "上传失败，请重试。" };
         });
 
         if (uploadTickerRef.current) clearInterval(uploadTickerRef.current);
         uploadTickerRef.current = null;
-        xhrsRef.current.delete(next.id);
+        controllersRef.current.delete(next.id);
         if (!mountedRef.current) break;
         if (result.kind === "unauthorized") {
           updateQueue((items) => items.map((item) => isActiveUpload(item) ? { ...item, status: "error", speedBps: null, error: "登录已过期，请重新登录。" } : item));
@@ -100,14 +137,15 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
           break;
         }
         if (result.kind === "done") {
+          forgetUpload(next.id);
           updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "done", loadedBytes: next.file.size, speedBps: null } : item));
           setFiles((current) => [result.file, ...current.filter((file) => file.id !== result.file.id)]);
           setSelectedFileId(result.file.id);
           notify(`“${result.file.name}”已上传完成，可以复制分享链接。`);
         } else if (result.kind === "canceled") {
-          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "canceled", speedBps: null } : item));
+          updateQueue((items) => items.map((item) => item.id === next.id && item.status !== "canceled" && item.status !== "queued" ? { ...item, status: "paused", speedBps: null } : item));
         } else {
-          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "error", loadedBytes: meter.loadedBytes, speedBps: null, error: result.message } : item));
+          updateQueue((items) => items.map((item) => item.id === next.id ? { ...item, status: "error", loadedBytes: baseline, speedBps: null, error: result.message } : item));
           notify(`${next.file.name}：${result.message}`);
         }
       }
@@ -120,17 +158,24 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
     const selectedFiles = Array.from(fileList);
     if (!selectedFiles.length) return;
     batchRef.current = nextUploadBatch(queueRef.current, batchRef.current);
-    const newItems: UploadItem[] = selectedFiles.map((file) => ({
-      id: crypto.randomUUID(),
-      batchId: batchRef.current,
-      file,
-      loadedBytes: 0,
-      speedBps: null,
-      status: file.size > maxUploadBytes ? "error" : "queued",
-      error: file.size > maxUploadBytes ? `超过单文件上限 ${formatSize(maxUploadBytes)}，未开始上传。` : undefined,
-      retryable: file.size <= maxUploadBytes,
-    }));
-    updateQueue((items) => [...items.filter((item) => !item.hidden || item.batchId === batchRef.current), ...newItems]);
+    const matched = new Set<string>();
+    const newItems: UploadItem[] = selectedFiles.map((file) => {
+      const restored = queueRef.current.find(item => item.needsFile && !matched.has(item.id) && item.file.name === file.name && item.file.size === file.size);
+      if (restored) matched.add(restored.id);
+      return {
+        id: restored?.id ?? uploadTaskId(),
+        sessionId: restored?.sessionId,
+        batchId: batchRef.current,
+        file,
+        loadedBytes: 0,
+        speedBps: null,
+        status: file.size > maxUploadBytes ? "error" : "queued",
+        error: file.size > maxUploadBytes ? `超过单文件上限 ${formatSize(maxUploadBytes)}，未开始上传。` : undefined,
+        retryable: file.size <= maxUploadBytes,
+      };
+    });
+    for (const item of newItems) if (item.retryable) saveUpload({ id: item.id, sessionId: item.sessionId, name: item.file.name, size: item.file.size, lastModified: item.file.lastModified, loadedBytes: 0, updated: Date.now() });
+    updateQueue((items) => [...items.filter((item) => !newItems.some(next => next.id === item.id) && (!item.hidden || item.batchId === batchRef.current)), ...newItems]);
     const readyCount = newItems.filter((item) => item.status === "queued").length;
     const rejectedCount = newItems.length - readyCount;
     if (readyCount && rejectedCount) notify(`${readyCount} 个文件已加入队列，${rejectedCount} 个文件超过大小上限。`);
@@ -188,7 +233,7 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
     originalTitleRef.current = document.title;
     return () => {
       mountedRef.current = false;
-      xhrsRef.current.forEach((xhr) => xhr.abort());
+      controllersRef.current.forEach((xhr) => xhr.abort());
       if (uploadTickerRef.current) clearInterval(uploadTickerRef.current);
       if (toastTimer.current) clearTimeout(toastTimer.current);
       document.title = originalTitleRef.current ?? document.title;
@@ -249,18 +294,26 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
     }
   }
 
+  function pauseUpload(upload: UploadItem) {
+    updateQueue(items => items.map(item => item.id === upload.id ? { ...item, status: "paused", loadedBytes: item.confirmedBytes ?? 0, speedBps: null } : item));
+    controllersRef.current.get(upload.id)?.abort();
+  }
+
   function cancelUpload(upload: UploadItem) {
-    if (upload.status === "uploading" || upload.status === "processing") xhrsRef.current.get(upload.id)?.abort();
-    else if (upload.status === "queued") {
-      updateQueue((items) => items.map((item) => item.id === upload.id ? { ...item, status: "canceled" } : item));
-    } else {
-      updateQueue((items) => items.map((item) => item.id === upload.id ? { ...item, hidden: true } : item));
+    updateQueue(items => items.map(item => item.id === upload.id ? { ...item, status: "canceled", hidden: true } : item));
+    controllersRef.current.get(upload.id)?.abort();
+    forgetUpload(upload.id);
+    if (upload.sessionId && upload.status !== "done") {
+      void fetch(`/api/uploads/${upload.sessionId}`, { method: "DELETE" }).then(response => {
+        if (!response.ok && response.status !== 410) notify("取消任务未成功，请重新选择文件后重试。");
+      }).catch(() => notify("网络中断，服务器上的未完成分片将在到期后清理。"));
     }
   }
 
   function retryUpload(upload: UploadItem) {
+    if (upload.needsFile) { pickerRef.current?.click(); return; }
     batchRef.current = nextUploadBatch(queueRef.current, batchRef.current);
-    updateQueue((items) => items.filter((item) => !item.hidden || item.batchId === batchRef.current).map((item) => item.id === upload.id ? { ...item, batchId: batchRef.current, status: "queued", loadedBytes: 0, speedBps: null, error: undefined } : item));
+    updateQueue((items) => items.filter((item) => !item.hidden || item.batchId === batchRef.current).map((item) => item.id === upload.id ? { ...item, batchId: batchRef.current, status: "queued", loadedBytes: item.confirmedBytes ?? 0, speedBps: null, error: undefined } : item));
     void runQueue();
   }
 
@@ -332,7 +385,7 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
                 <header className="fm-panel-header"><div className="fm-panel-title"><h2 id="upload-queue-title">上传队列</h2><span className="fm-count">{activeUploads}</span></div><button className="fm-text-button" disabled={!visibleUploads.some((item) => item.status === "done")} onClick={() => updateQueue((items) => items.map((item) => item.status === "done" ? { ...item, hidden: true } : item))} type="button">清除已完成</button></header>
                 {summary.totalCount > 0 && <UploadSummary summary={summary} />}
                 <div className="fm-queue-list">
-                  {visibleUploads.map((upload) => <UploadRow key={upload.id} item={upload} onCancel={cancelUpload} onRetry={retryUpload} />)}
+                  {visibleUploads.map((upload) => <UploadRow key={upload.id} item={upload} onCancel={cancelUpload} onPause={pauseUpload} onRetry={retryUpload} />)}
                   {visibleUploads.length === 0 && <div className="fm-queue-empty"><span className="fm-queue-empty-icon"><UploadIcon /></span><strong>当前没有上传任务</strong><span>选择文件或拖放到页面即可开始上传。</span><button className="fm-text-button" onClick={() => pickerRef.current?.click()} type="button">选择文件</button></div>}
                 </div>
                 <footer className="fm-panel-foot"><LockIcon />上传时可继续浏览和分享文件</footer>
@@ -380,24 +433,36 @@ function UploadSummary({ summary }: { summary: ReturnType<typeof summarizeUpload
   </div>;
 }
 
-function UploadRow({ item, onCancel, onRetry }: { item: UploadItem; onCancel: (item: UploadItem) => void; onRetry: (item: UploadItem) => void }) {
+function UploadRow({ item, onCancel, onPause, onRetry }: { onPause: (item: UploadItem) => void; item: UploadItem; onCancel: (item: UploadItem) => void; onRetry: (item: UploadItem) => void }) {
   const progress = fileUploadPercent(item);
   const transferring = item.status === "uploading" || item.status === "processing";
-  const statusLabel = item.status === "queued" ? "等待中" : item.status === "uploading" ? `${progress}%` : item.status === "processing" ? "处理中" : item.status === "done" ? "已完成" : item.status === "canceled" ? "已取消" : "上传失败";
+  const statusLabel = item.status === "paused" ? "已暂停" : item.status === "queued" ? "等待中" : item.status === "uploading" ? `${progress}%` : item.status === "processing" ? "处理中" : item.status === "done" ? "已完成" : item.status === "canceled" ? "已取消" : "上传失败";
   const remainingSeconds = item.speedBps !== null && item.speedBps > 0 && item.loadedBytes < item.file.size ? (item.file.size - item.loadedBytes) / item.speedBps : null;
   return (
     <div className={`fm-upload-row status-${item.status}`}>
       <span className="fm-upload-file-icon" data-type={item.file.name.split(".").pop()?.slice(0, 4).toUpperCase()}><FileGlyph name={item.file.name} /></span>
       <div className="fm-upload-row-main">
         <div className="fm-upload-file-info"><strong title={item.file.name}>{item.file.name}</strong><span className={`fm-upload-status status-${item.status}`}>{item.status === "done" && <CheckIcon />}{statusLabel}</span></div>
-        {(transferring || item.status === "done") && <UploadProgressBar value={progress} label={`${item.file.name} 上传进度`} />}
-        <div className="fm-upload-transfer-bytes">{transferring || item.status === "error" ? `${formatSize(item.loadedBytes)} / ${formatSize(item.file.size)}` : formatSize(item.file.size)}</div>
-        {transferring && <div className="fm-upload-transfer-meta">{item.status === "processing" ? <span role="status">服务器处理中</span> : <><span>{formatTransferSpeed(item.speedBps)}</span><span>预计剩余 {formatUploadDuration(remainingSeconds)}</span></>}</div>}
+        <div className="fm-upload-progress-row">
+          <div className="fm-upload-progress-main">
+            <UploadProgressBar value={progress} label={`${item.file.name} 上传进度`} />
+            <div className="fm-upload-transfer-stats">
+              <span>{transferring || item.status === "error" || item.status === "paused" ? `${formatSize(item.loadedBytes)} / ${formatSize(item.file.size)}` : formatSize(item.file.size)}</span>
+              {transferring && <span className="fm-upload-transfer-speed">{item.status === "processing" ? <span role="status">服务器处理中</span> : formatTransferSpeed(item.speedBps)}</span>}
+            </div>
+            {item.status === "uploading" && <div className="fm-upload-transfer-meta"><span>预计剩余 {formatUploadDuration(remainingSeconds)}</span></div>}
+          </div>
+          <div className="fm-upload-actions">
+            {(item.status === "uploading" || item.status === "queued") && <button className="fm-icon-button fm-queue-action" aria-label={`暂停上传 ${item.file.name}`} title="暂停上传" onClick={() => onPause(item)} type="button"><PauseIcon /></button>}
+            {item.status === "paused" && <><button className="fm-icon-button fm-queue-action" aria-label={`继续上传 ${item.file.name}`} title="继续上传" onClick={() => onRetry(item)} type="button"><PlayIcon /></button><button className="fm-icon-button fm-queue-action" title="取消上传" aria-label={`取消上传 ${item.file.name}`} onClick={() => onCancel(item)} type="button"><CloseIcon /></button></>}
+            {item.status === "error" && item.retryable !== false && <button className="fm-button fm-retry-button" onClick={() => onRetry(item)} type="button">重试</button>}
+            {isActiveUpload(item) && <button className="fm-icon-button fm-queue-action" title={transferring ? "取消上传" : "移除"} aria-label={transferring ? `取消上传 ${item.file.name}` : `移除 ${item.file.name}`} onClick={() => onCancel(item)} type="button"><CloseIcon /></button>}
+            {(item.status === "done" || item.status === "error" || item.status === "canceled") && <button className="fm-icon-button fm-queue-action" title="从队列移除" aria-label={`从队列移除 ${item.file.name}`} onClick={() => onCancel(item)} type="button"><CloseIcon /></button>}
+          </div>
+        </div>
+        {item.needsFile && <p className="fm-upload-error">请选择原文件继续</p>}
         {item.status === "error" && <p className="fm-upload-error">{item.error}</p>}
       </div>
-      {item.status === "error" && item.retryable !== false && <button className="fm-button fm-retry-button" onClick={() => onRetry(item)} type="button">重试</button>}
-      {isActiveUpload(item) && <button className="fm-icon-button fm-queue-action" aria-label={transferring ? `取消上传 ${item.file.name}` : `移除 ${item.file.name}`} onClick={() => onCancel(item)} type="button"><CloseIcon /></button>}
-      {(item.status === "done" || item.status === "error" || item.status === "canceled") && <button className="fm-icon-button fm-queue-action" aria-label={`从队列移除 ${item.file.name}`} onClick={() => onCancel(item)} type="button"><CloseIcon /></button>}
     </div>
   );
 }
@@ -458,6 +523,8 @@ function SparkleIcon() { return <svg aria-hidden="true" viewBox="0 0 20 20" fill
 function ChevronIcon() { return <svg aria-hidden="true" viewBox="0 0 16 16" fill="none"><path d="m6 3.5 4.5 4.5L6 12.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.4"/></svg>; }
 function LinkIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="none"><path d="M7.2 10.8 10.8 7.2m-5 5.8-1.3 1.3a3 3 0 0 1-4.2-4.2l3-3A3 3 0 0 1 7.5 7m3 4a3 3 0 0 0 4.2-.1l3-3a3 3 0 0 0-4.2-4.2l-1.3 1.3" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.4"/></svg>; }
 function TrashIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="none"><path d="M3.8 5.1h10.4m-9.2 0 .6 9.5c0 .5.5.9 1 .9h4.8c.5 0 1-.4 1-.9l.6-9.5M7 5.1V3.7c0-.5.4-.9.9-.9h2.2c.5 0 .9.4.9.9v1.4m-3.6 3v4.3m3.2-4.3v4.3" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.35"/></svg>; }
+function PauseIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="none"><path d="M6 4v10m6-10v10" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5"/></svg>; }
+function PlayIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="none"><path d="m6 3.5 8 5.5-8 5.5V3.5Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.5"/></svg>; }
 function CloseIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="none"><path d="m5 5 8 8m0-8-8 8" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5"/></svg>; }
 function CheckIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="none"><path d="m3.7 9.3 3.4 3.4 7.2-7.4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8"/></svg>; }
 function LockIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="none"><rect x="3.7" y="7.4" width="10.6" height="8" rx="2" stroke="currentColor" strokeWidth="1.4"/><path d="M6.2 7.3V5.6a2.8 2.8 0 0 1 5.6 0v1.7" stroke="currentColor" strokeLinecap="round" strokeWidth="1.4"/></svg>; }

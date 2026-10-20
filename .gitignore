@@ -7,3 +7,6 @@ data/
 *.tsbuildinfo
 npm-debug.log*
 pnpm-debug.log*
+
+# Local transfer test fixtures
+/test-upload-*.bin
