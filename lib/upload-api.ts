@@ -2,7 +2,7 @@ import { hasTrustedOrigin, isAuthenticatedRequest } from "@/lib/auth";
 import { cleanupUploads, TransferError } from "@/lib/resumable";
 import { publicDownloadUrl, type FileRecord } from "@/lib/files";
 export function shareFile(request: Request, file: FileRecord) {
-  return { id: file.id, name: file.file_name, size: file.size, createdAt: file.created_at, downloadUrl: publicDownloadUrl(request, file.share_token) };
+  return { id: file.id, name: file.file_name, size: file.size, createdAt: file.created_at, downloadUrl: publicDownloadUrl(request, file.share_token), sha256: file.sha256 };
 }
 export async function uploadApi(request: Request, action: () => Promise<unknown>, status = 200) {
   if (!isAuthenticatedRequest(request)) return Response.json({ error: "需要登录。" }, { status: 401 });

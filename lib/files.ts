@@ -1,5 +1,5 @@
-import { randomBytes, randomUUID } from "node:crypto";
-import { createWriteStream, promises as fs } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createReadStream, createWriteStream, promises as fs } from "node:fs";
 import { basename, join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -11,6 +11,7 @@ export type FileRecord = {
   size: number;
   share_token: string;
   created_at: number;
+  sha256: string | null;
 };
 
 export class UploadTooLargeError extends Error {
@@ -41,19 +42,45 @@ export function publicDownloadUrl(request: Request, token: string) {
 }
 
 export function listFiles() {
-  return db.prepare("SELECT id, file_name, size, share_token, created_at FROM files ORDER BY created_at DESC").all() as FileRecord[];
+  return db.prepare("SELECT id, file_name, size, share_token, created_at, sha256 FROM files ORDER BY created_at DESC").all() as FileRecord[];
 }
 
 export function getFileById(id: string) {
-  return db.prepare("SELECT id, file_name, size, share_token, created_at FROM files WHERE id = ?").get(id) as
+  return db.prepare("SELECT id, file_name, size, share_token, created_at, sha256 FROM files WHERE id = ?").get(id) as
     | FileRecord
     | undefined;
 }
 
 export function getFileByToken(token: string) {
-  return db.prepare("SELECT id, file_name, size, share_token, created_at FROM files WHERE share_token = ?").get(token) as
+  return db.prepare("SELECT id, file_name, size, share_token, created_at, sha256 FROM files WHERE share_token = ?").get(token) as
     | FileRecord
     | undefined;
+}
+
+const pendingFileHashes = new Map<string, Promise<string>>();
+
+export function getFileSha256(file: FileRecord): Promise<string> {
+  if (file.sha256 !== null) return Promise.resolve(file.sha256);
+
+  const pending = pendingFileHashes.get(file.id);
+  if (pending) return pending;
+
+  const calculation = (async () => {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(join(filesDirectory, file.id))) {
+      hash.update(chunk);
+    }
+    const sha256 = hash.digest("hex");
+    db.prepare("UPDATE files SET sha256 = ? WHERE id = ? AND sha256 IS NULL").run(sha256, file.id);
+    const updated = getFileById(file.id);
+    if (!updated) throw new Error("文件不存在。");
+    return updated.sha256 ?? sha256;
+  })();
+
+  pendingFileHashes.set(file.id, calculation);
+  return calculation.finally(() => {
+    if (pendingFileHashes.get(file.id) === calculation) pendingFileHashes.delete(file.id);
+  });
 }
 
 export async function saveUploadedFile(request: Request, fileName: string) {
@@ -66,6 +93,7 @@ export async function saveUploadedFile(request: Request, fileName: string) {
   const tempPath = join(tempDirectory, `${id}.part`);
   const finalPath = join(filesDirectory, id);
   let size = 0;
+  const hash = createHash("sha256");
 
   const counter = new Transform({
     transform(chunk: Buffer | Uint8Array, _encoding, callback) {
@@ -74,6 +102,7 @@ export async function saveUploadedFile(request: Request, fileName: string) {
         callback(new UploadTooLargeError());
         return;
       }
+      hash.update(chunk);
       callback(null, chunk);
     },
   });
@@ -89,12 +118,14 @@ export async function saveUploadedFile(request: Request, fileName: string) {
     await fs.rename(tempPath, finalPath);
 
     const shareToken = randomBytes(32).toString("base64url");
-    db.prepare("INSERT INTO files(id, file_name, size, share_token, created_at) VALUES (?, ?, ?, ?, ?)").run(
+    const sha256 = hash.digest("hex");
+    db.prepare("INSERT INTO files(id, file_name, size, share_token, created_at, sha256) VALUES (?, ?, ?, ?, ?, ?)").run(
       id,
       fileName,
       size,
       shareToken,
       Date.now(),
+      sha256,
     );
 
     return getFileById(id)!;

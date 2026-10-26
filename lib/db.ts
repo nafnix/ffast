@@ -57,7 +57,8 @@ function createDatabase() {
       file_name TEXT NOT NULL,
       size INTEGER NOT NULL,
       share_token TEXT NOT NULL UNIQUE,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      sha256 TEXT
     );
     CREATE INDEX IF NOT EXISTS files_created_idx ON files(created_at DESC);
   `);
@@ -76,6 +77,14 @@ export const db = globalWithDatabase.__ffastDatabase ?? createDatabase();
 if (process.env.NODE_ENV !== "production") {
   globalWithDatabase.__ffastDatabase = db;
 }
+
+// Additive migration for databases created before file hashes were stored.
+db.transaction(() => {
+  const columns = db.prepare("PRAGMA table_info(files)").all() as { name: string }[];
+  if (!columns.some((column) => column.name === "sha256")) {
+    db.exec("ALTER TABLE files ADD COLUMN sha256 TEXT");
+  }
+})();
 
 export function isInitialized() {
   return Boolean(db.prepare("SELECT 1 FROM settings WHERE key = ?").get("admin_password_hash"));

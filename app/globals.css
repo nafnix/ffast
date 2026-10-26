@@ -489,10 +489,16 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .fm-detail-fields > div { display: flex; align-items: start; justify-content: space-between; gap: 12px; font-size: 12px; }
 .fm-detail-fields dt { flex: 0 0 auto; color: #73737c; }
 .fm-detail-fields dd { min-width: 0; margin: 0; color: #4e4e57; font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
+.fm-detail-fields dd.fm-hash-value { max-width: 75%; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 10px; line-height: 1.5; }
 .fm-detail-url { display: flex; min-height: 34px; align-items: flex-start; gap: 7px; margin-top: 13px; padding: 8px; border: 1px solid #e5e5ea; border-radius: 5px; color: #6c6c76; background: #fcfcfd; }
 .fm-detail-url svg { width: 14px; height: 14px; margin-top: 1px; }
 .fm-detail-url span { min-width: 0; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .fm-copy-detail { width: 100%; margin-top: 9px; }
+.fm-download-detail { width: 100%; margin-top: 10px; text-decoration: none; }
+.fm-command-buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 7px; }
+.fm-command-detail { display: inline-flex; min-width: 0; min-height: 32px; align-items: center; justify-content: center; gap: 5px; padding: 0 6px; border: 1px solid #e2e2e7; border-radius: 5px; color: #55555e; background: #fff; font-size: 11px; white-space: nowrap; }
+.fm-command-detail:hover { border-color: #c9c9d0; color: #33333a; background: #f7f7f8; }
+.fm-command-detail svg { width: 14px; height: 14px; }
 .fm-delete-detail { display: inline-flex; min-height: 31px; align-items: center; justify-content: center; gap: 6px; width: 100%; margin-top: 5px; border: 0; border-radius: 5px; color: #925052; background: transparent; font-size: 12px; }
 .fm-delete-detail svg { width: 14px; height: 14px; }
 .fm-delete-detail:hover { color: #833b40; background: #fcf6f6; }

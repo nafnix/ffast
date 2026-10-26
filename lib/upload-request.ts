@@ -28,7 +28,7 @@ export function sendUpload(file: File, xhr: XMLHttpRequest, callbacks: { onProgr
         } catch { /* use status fallback */ }
         if (xhr.status === 401) finish({ kind: "unauthorized" });
         else if (xhr.status === 201 && body.id && body.name && body.downloadUrl) {
-          finish({ kind: "done", file: { id: body.id, name: body.name, size: body.size ?? file.size, createdAt: body.createdAt ?? Date.now(), downloadUrl: body.downloadUrl } });
+          finish({ kind: "done", file: { id: body.id, name: body.name, size: body.size ?? file.size, createdAt: body.createdAt ?? Date.now(), downloadUrl: body.downloadUrl, sha256: body.sha256 ?? null } });
         } else {
           finish({ kind: "error", message: body.error || (xhr.status === 413 ? "文件超过服务器的大小上限。" : `上传失败（${xhr.status || "网络错误"}），请重试。`) });
         }

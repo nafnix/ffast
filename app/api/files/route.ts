@@ -14,6 +14,7 @@ export function GET(request: Request) {
     size: file.size,
     createdAt: file.created_at,
     downloadUrl: publicDownloadUrl(request, file.share_token),
+    sha256: file.sha256,
   }));
   return NextResponse.json({ files });
 }
@@ -32,6 +33,7 @@ export async function POST(request: Request) {
         size: file.size,
         createdAt: file.created_at,
         downloadUrl: publicDownloadUrl(request, file.share_token),
+        sha256: file.sha256,
       },
       { status: 201 },
     );

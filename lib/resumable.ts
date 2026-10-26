@@ -103,19 +103,22 @@ export async function finishUpload(id: string) {
   const assembled = join(directory, id, "assembled.tmp");
   const output = await fs.open(assembled, "w", 0o600);
   let size = 0;
+  const fileHash = createHash("sha256");
   try {
     for (let i = 0; i < hashes.length; i++) {
       const bytes = await fs.readFile(join(directory, id, String(i))).catch(() => { throw new TransferError("尚有分片未上传。", 409); });
       if (createHash("sha256").update(bytes).digest("hex") !== hashes[i]) throw new TransferError("分片校验失败。", 409);
       size += bytes.length;
+      fileHash.update(bytes);
       await output.writeFile(bytes);
     }
     if (size !== row.size) throw new TransferError("文件大小校验失败。", 409);
     await output.sync();
   } finally { await output.close(); }
+  const sha256 = fileHash.digest("hex");
   await fs.rename(assembled, finalPath);
   db.transaction(() => {
-    db.prepare("INSERT INTO files(id,file_name,size,share_token,created_at) VALUES(?,?,?,?,?)").run(id, row.name, size, randomBytes(32).toString("base64url"), Date.now());
+    db.prepare("INSERT INTO files(id,file_name,size,share_token,created_at,sha256) VALUES(?,?,?,?,?,?)").run(id, row.name, size, randomBytes(32).toString("base64url"), Date.now(), sha256);
     db.prepare("UPDATE uploads SET file_id = ?, updated = ? WHERE id = ?").run(id, Date.now(), id);
   })();
   await fs.rm(join(directory, id), { recursive: true, force: true });

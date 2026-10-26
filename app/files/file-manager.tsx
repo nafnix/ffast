@@ -11,6 +11,7 @@ export type ShareFile = {
   size: number;
   createdAt: number;
   downloadUrl: string;
+  sha256: string | null;
 };
 
 type FileManagerProps = { initialFiles: ShareFile[]; maxUploadBytes: number };
@@ -24,6 +25,7 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
   const [toast, setToast] = useState("");
   const [loading, setLoading] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [hashStatus, setHashStatus] = useState<{ fileId: string; status: "loading" | "error" } | null>(null);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(initialFiles[0]?.id ?? null);
   const queueRef = useRef<UploadItem[]>([]);
   const controllersRef = useRef<Map<string, AbortController>>(new Map());
@@ -270,6 +272,20 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
     }
   }, [notify]);
 
+  const copyDownloadCommand = useCallback(async (file: ShareFile, client: "wget" | "curl") => {
+    const url = shellQuote(file.downloadUrl);
+    const filename = shellQuote(file.name);
+    const command = client === "wget"
+      ? `wget --quiet --output-document=- ${url} > ${filename}`
+      : `curl --fail --location ${url} > ${filename}`;
+    try {
+      await navigator.clipboard.writeText(command);
+      notify(`${client} 命令已复制到剪贴板。`);
+    } catch {
+      notify("复制失败，请检查浏览器剪贴板权限。");
+    }
+  }, [notify]);
+
   async function deleteFile(file: ShareFile) {
     if (!window.confirm(`确定删除“${file.name}”吗？删除后，此分享链接将立即失效。`)) return;
     try {
@@ -325,6 +341,36 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
     document.title = progressTitle ?? originalTitleRef.current ?? document.title;
   }, [progressTitle]);
   const filteredSelectedFile = filteredFiles.find((file) => file.id === selectedFileId) ?? filteredFiles[0] ?? null;
+  const selectedFileIdForHash = filteredSelectedFile?.id ?? null;
+  const selectedFileHash = filteredSelectedFile?.sha256 ?? null;
+  useEffect(() => {
+    if (!selectedFileIdForHash) {
+      setHashStatus(null);
+      return;
+    }
+    if (selectedFileHash) {
+      setHashStatus(null);
+      return;
+    }
+
+    let active = true;
+    setHashStatus({ fileId: selectedFileIdForHash, status: "loading" });
+    void (async () => {
+      try {
+        const response = await fetch(`/api/files/${encodeURIComponent(selectedFileIdForHash)}`, { cache: "no-store" });
+        if (redirectOnUnauthorized(response.status, (path) => window.location.assign(path))) return;
+        const body = (await response.json()) as { sha256?: string; error?: string };
+        if (!response.ok || !body.sha256) throw new Error(body.error || "无法读取文件哈希。");
+        if (!active) return;
+        setFiles((current) => current.map((item) => item.id === selectedFileIdForHash ? { ...item, sha256: body.sha256! } : item));
+        setHashStatus((current) => current?.fileId === selectedFileIdForHash ? null : current);
+      } catch {
+        if (active) setHashStatus({ fileId: selectedFileIdForHash, status: "error" });
+      }
+    })();
+
+    return () => { active = false; };
+  }, [selectedFileIdForHash, selectedFileHash]);
   const totalBytes = files.reduce((total, file) => total + file.size, 0);
   const filteredBytes = filteredFiles.reduce((total, file) => total + file.size, 0);
 
@@ -395,11 +441,15 @@ export function FileManager({ initialFiles, maxUploadBytes }: FileManagerProps) 
                 <header className="fm-panel-header"><h2 id="file-detail-title">文件详情</h2>{filteredSelectedFile && <span className="fm-detail-status"><span />链接有效</span>}</header>
                 {filteredSelectedFile ? <div className="fm-detail-content">
                   <div className="fm-detail-file"><span className="fm-detail-glyph" data-type={filteredSelectedFile.name.split(".").pop()?.slice(0, 4).toUpperCase()}><FileGlyph name={filteredSelectedFile.name} /></span><div><strong title={filteredSelectedFile.name}>{filteredSelectedFile.name}</strong><span>分享链接已启用</span></div></div>
-                  <dl className="fm-detail-fields"><div><dt>文件大小</dt><dd>{formatSize(filteredSelectedFile.size)}</dd></div><div><dt>上传时间</dt><dd>{formatDate(filteredSelectedFile.createdAt)}</dd></div><div><dt>分享方式</dt><dd>链接直接下载</dd></div></dl>
+                  <dl className="fm-detail-fields"><div><dt>文件大小</dt><dd>{formatSize(filteredSelectedFile.size)}</dd></div><div><dt>上传时间</dt><dd>{formatDate(filteredSelectedFile.createdAt)}</dd></div><div><dt>分享方式</dt><dd>链接直接下载</dd></div><div><dt>SHA-256</dt><dd className="fm-hash-value" title={filteredSelectedFile.sha256 ?? undefined}>{filteredSelectedFile.sha256 ?? (hashStatus?.fileId === filteredSelectedFile.id ? hashStatus.status === "loading" ? "计算中…" : "无法读取" : "计算中…")}</dd></div></dl>
                   <div className="fm-detail-url" title={filteredSelectedFile.downloadUrl}><LinkIcon /><span>{filteredSelectedFile.downloadUrl}</span></div>
+                  <a className="fm-button fm-download-detail" href={filteredSelectedFile.downloadUrl}><DownloadIcon />下载文件</a>
+                  <div className="fm-command-buttons">
+                    <button className="fm-command-detail" onClick={() => void copyDownloadCommand(filteredSelectedFile, "wget")} type="button" title="复制 wget 下载命令"><TerminalIcon />复制 wget</button>
+                    <button className="fm-command-detail" onClick={() => void copyDownloadCommand(filteredSelectedFile, "curl")} type="button" title="复制 curl 下载命令"><TerminalIcon />复制 curl</button>
+                  </div>
                   <button className="fm-button fm-copy-detail" onClick={() => void copyLink(filteredSelectedFile)} type="button"><LinkIcon />复制分享链接</button>
                   <button className="fm-delete-detail" onClick={() => void deleteFile(filteredSelectedFile)} type="button"><TrashIcon />删除文件</button>
-                  <p className="fm-detail-note"><TerminalIcon />支持 curl / wget 直接下载</p>
                 </div> : <div className="fm-detail-empty"><span className="fm-detail-empty-icon"><FolderIcon /></span><strong>{files.length === 0 ? "文件库还是空的" : "没有匹配的文件"}</strong><span>{query ? "清除搜索条件，继续查看文件详情。" : "上传的文件会显示在这里。"}</span></div>}
               </section>
             </aside>
@@ -421,6 +471,10 @@ function UploadProgressBar({ value, label }: { value: number; label: string }) {
 
 function formatTransferSpeed(speedBps: number | null) {
   return speedBps === null ? "—" : `${formatSize(Math.round(speedBps))}/s`;
+}
+
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function UploadSummary({ summary }: { summary: ReturnType<typeof summarizeUploads> }) {
@@ -530,4 +584,5 @@ function CheckIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="
 function LockIcon() { return <svg aria-hidden="true" viewBox="0 0 18 18" fill="none"><rect x="3.7" y="7.4" width="10.6" height="8" rx="2" stroke="currentColor" strokeWidth="1.4"/><path d="M6.2 7.3V5.6a2.8 2.8 0 0 1 5.6 0v1.7" stroke="currentColor" strokeLinecap="round" strokeWidth="1.4"/></svg>; }
 function LogoutIcon() { return <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M8 4H5.2a1.2 1.2 0 0 0-1.2 1.2v9.6A1.2 1.2 0 0 0 5.2 16H8m3.2-9.2L15 10l-3.8 3.2M7.3 10H15" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5"/></svg>; }
 function TerminalIcon() { return <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="m3.5 5 4.2 4.2-4.2 4.2m6.7.1h6.3" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5"/></svg>; }
+function DownloadIcon() { return <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M10 3.5v8m0 0 3-3m-3 3-3-3M4 13.5v2.2c0 .4.3.8.8.8h10.4c.4 0 .8-.4.8-.8v-2.2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5"/></svg>; }
 function FolderIcon() { return <svg aria-hidden="true" viewBox="0 0 28 28" fill="none"><path d="M3.8 7.7c0-1 .8-1.7 1.7-1.7h6.2l2.1 2.2h8.7c1 0 1.7.8 1.7 1.7v10.4c0 1-.8 1.7-1.7 1.7H5.5c-1 0-1.7-.8-1.7-1.7V7.7Z" stroke="currentColor" strokeWidth="1.5"/><path d="M4.3 11.4h19.4" stroke="currentColor" strokeWidth="1.5"/></svg>; }

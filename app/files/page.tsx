@@ -23,6 +23,7 @@ export default async function FilesPage() {
     size: file.size,
     createdAt: file.created_at,
     downloadUrl: new URL(`/download/${file.share_token}`, baseUrl).toString(),
+    sha256: file.sha256,
   }));
 
   return <FileManager initialFiles={files} maxUploadBytes={getMaxUploadBytes()} />;
